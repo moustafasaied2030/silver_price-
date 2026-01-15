@@ -12,24 +12,22 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="تحليل وتوقع الفضة الشامل", layout="wide")
 
 st.title('🔮 منصة تحليل وتوقع أسعار الفضة (SI=F)')
-st.markdown("""
-هذا التطبيق يجمع بين:
-1. **حاسبة الأسعار:** لتوقع السعر في يوم محدد.
-2. **التحليل الفني:** لعرض الاتجاه العام (Trend) والموسمية (Seasonality).
-""")
 st.markdown("---")
 
 # ---------------------------------------------------------
-# 2. القائمة الجانبية (للمدخلات والتحكم)
+# 2. القائمة الجانبية
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ إعدادات التوقع")
     
     # اختيار تاريخ معين للمعرفة السعر عنده
+    # نجعل الافتراضي بعد شهر من الآن
+    default_date = date.today() + timedelta(days=30)
+    
     target_date = st.date_input(
         "📅 اختر التاريخ المستهدف للتوقع:",
         min_value=date.today() + timedelta(days=1),
-        value=date.today() + timedelta(days=30)
+        value=default_date
     )
     
     st.markdown("---")
@@ -37,53 +35,83 @@ with st.sidebar:
     n_years = st.slider('عدد سنوات البيانات التاريخية للتدريب:', 1, 15, 5)
 
 # ---------------------------------------------------------
-# 3. دالة جلب وتجهيز البيانات (مع إصلاح الأخطاء)
+# 3. دالة المعالجة والذكاء الاصطناعي (تم إصلاح المشاكل هنا)
 # ---------------------------------------------------------
 @st.cache_data
 def load_and_predict(years, target_d):
-    # تحديد تواريخ التحميل
+    # 1. تحديد فترة البيانات
     start_date = (date.today().replace(year=date.today().year - years)).strftime('%Y-%m-%d')
     end_date = date.today().strftime('%Y-%m-%d')
     
-    # تحميل البيانات
+    # 2. تحميل البيانات
     data = yf.download("SI=F", start=start_date, end=end_date, progress=False)
-    
-    # إصلاح مشكلة MultiIndex في yfinance الجديد
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    
     data.reset_index(inplace=True)
+
+    # 3. تنظيف البيانات (الحل الجذري لمشكلة yfinance)
+    # نقوم بإنشاء DataFrame جديد ونظيف تماماً
+    df = pd.DataFrame()
     
-    # تجهيز البيانات لـ Prophet
-    df = data[['Date', 'Close']].copy()
-    df = df.rename(columns={"Date": "ds", "Close": "y"})
+    # التأكد من عمود التاريخ
+    if 'Date' in data.columns:
+        df['ds'] = data['Date']
+    else:
+        # أحيانا يكون التاريخ هو الـ index بعد التحديثات
+        df['ds'] = data.index
+
+    # التأكد من عمود السعر (Close)
+    # نحاول الوصول لعمود Close بأي طريقة كانت سواء كان MultiIndex أو عادي
+    try:
+        # محاولة الوصول المباشر
+        close_data = data['Close']
+    except KeyError:
+        # محاولة الوصول عن طريق xs في حالة MultiIndex المعقد
+        try:
+            close_data = data.xs('Close', axis=1, level=0)
+        except:
+            # إذا فشل كل شيء، نأخذ العمود الثاني (عادة هو السعر بعد التاريخ)
+            close_data = data.iloc[:, 1]
+
+    # تحويل البيانات إلى أرقام وإجبارها أن تكون 1D array (حل مشكلة TypeError)
+    if isinstance(close_data, pd.DataFrame):
+        df['y'] = close_data.iloc[:, 0].values
+    else:
+        df['y'] = close_data.values
+
+    # إزالة المنطقة الزمنية
     df['ds'] = pd.to_datetime(df['ds']).dt.tz_localize(None)
     
-    # بناء النموذج وتدريبه
+    # حذف أي صفوف فارغة قد تسبب مشاكل
+    df.dropna(inplace=True)
+
+    # 4. تدريب النموذج
     m = Prophet(daily_seasonality=True)
     m.fit(df)
     
-    # حساب الفترة الزمنية حتى التاريخ المستهدف
+    # 5. التوقع
+    # حساب الفرق بالأيام
     days_diff = (target_d - date.today()).days
-    # إضافة هامش بسيط للتأكد من تغطية التاريخ
-    if days_diff < 1: days_diff = 1
     
-    future = m.make_future_dataframe(periods=days_diff)
+    # هامش أمان: نضيف 10 أيام زيادة للتأكد من أن التاريخ المستهدف موجود داخل التوقع
+    # (هذا يحل مشكلة "التاريخ بعيد جداً")
+    future_days = days_diff + 10
+    
+    future = m.make_future_dataframe(periods=future_days)
     forecast = m.predict(future)
     
     return m, forecast
 
 # ---------------------------------------------------------
-# 4. التنفيذ والعرض
+# 4. واجهة العرض
 # ---------------------------------------------------------
 try:
-    with st.spinner('جاري جلب البيانات، تدريب الذكاء الاصطناعي، ورسم المخططات...'):
+    with st.spinner('جاري جلب البيانات وتدريب النموذج...'):
         model, forecast = load_and_predict(n_years, target_date)
 
-    # --- أولاً: عرض السعر المتوقع (طلبك الخاص بالحاسبة) ---
+    # --- القسم الأول: عرض السعر ---
     st.subheader(f"💰 السعر المتوقع ليوم: {target_date}")
     
-    # استخراج السعر
+    # البحث عن التاريخ في النتائج
+    # نستخدم dt.date للمقارنة الصحيحة
     prediction_row = forecast[forecast['ds'].dt.date == target_date]
     
     if not prediction_row.empty:
@@ -91,36 +119,39 @@ try:
         lower = prediction_row['yhat_lower'].values[0]
         upper = prediction_row['yhat_upper'].values[0]
         
-        # عرض جذاب للرقم
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.markdown(f"""
-            <div style="text-align: center; border: 2px solid #4CAF50; padding: 10px; border-radius: 10px; background-color: #f9f9f9;">
-                <h2 style="color: #333; margin:0;">${price:.2f}</h2>
-                <p style="color: gray; font-size: 14px;">(المدى المتوقع: {lower:.2f} - {upper:.2f})</p>
-            </div>
-            """, unsafe_allow_html=True)
+        # تصميم كارت السعر
+        st.markdown(f"""
+        <div style="
+            background-color: #e8f5e9; 
+            padding: 20px; 
+            border-radius: 15px; 
+            border: 1px solid #c8e6c9; 
+            text-align: center; 
+            margin-bottom: 25px;">
+            <h1 style="color: #2e7d32; margin:0; font-size: 50px;">${price:.2f}</h1>
+            <p style="color: #666; margin-top: 5px;">
+                النطاق المتوقع: بين <b>{lower:.2f}</b> و <b>{upper:.2f}</b> دولار
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        st.error("التاريخ المختار بعيد جداً أو غير صالح.")
+        # رسالة خطأ أوضح في حال عدم وجود التاريخ
+        st.warning(f"لم يتم العثور على توقع لهذا التاريخ ({target_date}). حاول اختيار تاريخ أقرب قليلاً.")
 
-    st.markdown("---")
-
-    # --- ثانياً: الرسم البياني التفاعلي (Main Chart) ---
-    st.subheader("📈 مسار السعر (البيانات التاريخية + التوقع)")
+    # --- القسم الثاني: الرسم البياني ---
+    st.subheader("📈 مسار السعر (الماضي + المستقبل)")
     fig_main = plot_plotly(model, forecast)
     fig_main.update_layout(yaxis_title="سعر الفضة (USD)", xaxis_title="التاريخ")
     st.plotly_chart(fig_main, use_container_width=True)
 
     st.markdown("---")
 
-    # --- ثالثاً: رسومات Trend و Seasonality ---
-    st.subheader("📊 تحليل المكونات (Trend & Seasonality)")
-    st.info("هذه الرسومات توضح الاتجاه العام للسوق، وتأثير أيام الأسبوع، وتأثير شهور السنة على السعر.")
-    
-    # استخدام matplotlib لرسم المكونات
+    # --- القسم الثالث: التحليل الفني ---
+    st.subheader("📊 العوامل المؤثرة (Trend & Seasonality)")
     fig2 = model.plot_components(forecast)
     st.pyplot(fig2)
 
 except Exception as e:
-    st.error(f"حدث خطأ أثناء التشغيل: {e}")
-    st.write("تفاصيل الخطأ:", e)
+    # عرض الأخطاء بشكل مفصل للمساعدة في الحل
+    st.error("حدث خطأ غير متوقع:")
+    st.code(str(e))
